@@ -24,3 +24,6 @@ dagster_home/
 # OS junk
 Thumbs.db
 desktop.ini
+
+# Local configs containing real secrets - never commit
+*.local.json
