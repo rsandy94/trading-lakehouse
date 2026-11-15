@@ -38,6 +38,18 @@ venv\Scripts\python scripts\kafka_trade_producer.py
 curl -X POST http://localhost:8083/connectors -H "Content-Type: application/json" -d @connect/snowflake_iceberg_sink.json
 ```
 
+## Running Dagster
+
+The dbt project lives in a separate repo, [trading-lakehouse-dbt](https://github.com/rsandy94/trading-lakehouse-dbt). Clone it, set `DBT_PROJECT_DIR` in `.env` to that checkout, then start Dagster from this repo:
+
+```bash
+dagster dev -f dagster_orchestrator/definitions.py
+```
+
+- **Sensor:** `bronze_iceberg_stream_sensor` calls `SYSTEM$STREAM_HAS_DATA` on `BRONZE.TRADING.TRADE_EVENTS_STREAM` every 60 seconds and launches `trading_pipeline_job` when committed rows are waiting. It skips while a previous run is still in progress.
+- **Quality check:** `check_trade_quarantine_threshold` runs after `fct_trade_executions`. It computes the pass rate of the latest batch (rows promoted to Gold vs. rows quarantined) and fails below `QUARANTINE_PASS_RATE_THRESHOLD_PCT` (default 98%).
+- **Alerts:** if `ALERT_WEBHOOK_URL` is set to a Slack incoming webhook, a failed check posts the pass rate and quarantine count to it.
+
 ## Security note
 
 The connector configs are committed as **sanitized templates** — the Snowflake private key, account identifier, service user, and role are placeholders. Keep real credentials in `.env` / `keys/` (both gitignored) or a secrets manager. Never commit private keys.
