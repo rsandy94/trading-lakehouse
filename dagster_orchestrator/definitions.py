@@ -1,8 +1,11 @@
+import json
 import os
+import time
+import urllib.request
 from pathlib import Path
+
 import snowflake.connector
 from cryptography.hazmat.primitives import serialization
-import time
 from dagster import (
     AssetCheckResult,
     AssetCheckSeverity,
@@ -13,19 +16,27 @@ from dagster import (
     RunRequest,
     SensorEvaluationContext,
     DagsterRunStatus,
+    RunsFilter,
     SkipReason,
     asset_check,
     define_asset_job,
+    get_dagster_logger,
     sensor,
 )
 from dagster_dbt import DbtCliResource, DbtProject, dbt_assets, get_asset_key_for_model
 
-dbt_project_dir = Path(
-    os.getenv(
-        "DBT_PROJECT_DIR",
-        r"C:\Users\sande\Documents\Trading Lakehouse dbt\trading_lakehouse_dbt",
+# Minimum share of a batch (Gold rows / (Gold + quarantine rows)) that must pass the
+# Silver quality rules. Below this, the asset check fails and alerts on-call.
+PASS_RATE_THRESHOLD_PCT = float(os.getenv("QUARANTINE_PASS_RATE_THRESHOLD_PCT", "98.0"))
+
+# Optional Slack (or Slack-compatible) incoming webhook for check failures.
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
+
+if not os.getenv("DBT_PROJECT_DIR"):
+    raise RuntimeError(
+        "Set DBT_PROJECT_DIR to your local trading-lakehouse-dbt checkout (see .env.example)."
     )
-).resolve()
+dbt_project_dir = Path(os.environ["DBT_PROJECT_DIR"]).resolve()
 dbt_profiles_dir = Path(os.getenv("DBT_PROFILES_DIR", Path.home() / ".dbt")).resolve()
 
 dbt_project = DbtProject(project_dir=dbt_project_dir, profiles_dir=dbt_profiles_dir)
@@ -63,7 +74,7 @@ def get_snowflake_connection():
     return snowflake.connector.connect(
         user=os.getenv("SNOWFLAKE_USER"),
         account=os.getenv("SNOWFLAKE_ACCOUNT"),
-        role=os.getenv("SNOWFLAKE_ROLE", "ACCOUNTADMIN"),
+        role=os.getenv("SNOWFLAKE_ROLE"),  # least-privilege role from .env; no ACCOUNTADMIN default
         warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
         database="BRONZE",
         schema="TRADING",
@@ -82,11 +93,14 @@ def bronze_iceberg_stream_sensor(context: SensorEvaluationContext):
     Cloud Services metadata layer without waking up a Virtual Warehouse.
     """
 
-    in_progress_runs = [
-        run for run in context.instance.get_runs(limit=5)
-        if run.job_name == "trading_pipeline_job"
-        and run.status in (DagsterRunStatus.QUEUED, DagsterRunStatus.STARTED, DagsterRunStatus.STARTING)
-    ]
+    # Filter in the query: limit=5 across all jobs could miss an active run of this one.
+    in_progress_runs = context.instance.get_runs(
+        filters=RunsFilter(
+            job_name="trading_pipeline_job",
+            statuses=[DagsterRunStatus.QUEUED, DagsterRunStatus.STARTING, DagsterRunStatus.STARTED],
+        ),
+        limit=1,
+    )
     if in_progress_runs:
         return SkipReason(
             f"Run {in_progress_runs[0].run_id[:8]} currently in progress. Skipping evaluation."
@@ -110,49 +124,92 @@ def bronze_iceberg_stream_sensor(context: SensorEvaluationContext):
                 run_key=f"iceberg_stream_commit_{previous_cursor or 'init'}",
                 run_config={},
             )
-        return SkipReason("No new Iceberg manifest commits detected in BRONZE_TRADE_EVENTS_STREAM.")
+        return SkipReason("No new Iceberg manifest commits detected in TRADE_EVENTS_STREAM.")
     finally:
         conn.close()
 
+def send_alert(text: str) -> None:
+    """Post to ALERT_WEBHOOK_URL if configured. Never raises: alerting must not break the check."""
+    if not ALERT_WEBHOOK_URL:
+        return
+    request = urllib.request.Request(
+        ALERT_WEBHOOK_URL,
+        data=json.dumps({"text": text}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(request, timeout=10)
+    except Exception as exc:  # noqa: BLE001
+        get_dagster_logger().warning(f"Alert webhook failed: {exc}")
+
+
 @asset_check(
     asset=get_asset_key_for_model([trading_dbt_assets], "fct_trade_executions"),
-    description="Computes batch Pass/Fail score across Silver Split-Gate Quarantine and Gold Fact table.",
+    description=(
+        "Pass rate of the latest batch across the Silver split-gate quarantine and the Gold "
+        f"fact table. Fails below {PASS_RATE_THRESHOLD_PCT}% and alerts on-call."
+    ),
 )
 def check_trade_quarantine_threshold(context: AssetCheckExecutionContext) -> AssetCheckResult:
     conn = get_snowflake_connection()
     try:
         with conn.cursor() as cur:
+            # The latest batch is everything stg_trade_events_cdc consumed in its last run,
+            # identified by _stream_consumed_at (one value per dbt run). Counting by
+            # calendar day instead would mix every batch since midnight.
             cur.execute("""
-                WITH batch_stats AS (
+                WITH latest_batch AS (
+                    SELECT MAX(_stream_consumed_at) AS consumed_at
+                    FROM SILVER.STAGING.STG_TRADE_EVENTS_CDC
+                ),
+                batch_ids AS (
+                    SELECT DISTINCT c.trade_id
+                    FROM SILVER.STAGING.STG_TRADE_EVENTS_CDC c
+                    JOIN latest_batch b ON c._stream_consumed_at = b.consumed_at
+                ),
+                batch_stats AS (
                     SELECT
                         (SELECT COUNT(*) FROM GOLD.CORE.FCT_TRADE_EXECUTIONS
-                         WHERE ingested_date = CURRENT_DATE()) AS valid_count,
+                         WHERE trade_id IN (SELECT trade_id FROM batch_ids)) AS valid_count,
                         (SELECT COUNT(*) FROM SILVER.INTERMEDIATE.QUARANTINE_TRADE_EVENTS
-                         WHERE quarantined_date = CURRENT_DATE()) AS quarantine_count
+                         WHERE trade_id IN (SELECT trade_id FROM batch_ids)) AS quarantine_count
                 )
                 SELECT
                     valid_count,
                     quarantine_count,
-                    ROUND(
-                        DIV0(valid_count, (valid_count + quarantine_count)) * 100, 4
-                    ) AS pass_rate_pct
+                    ROUND(DIV0(valid_count, valid_count + quarantine_count) * 100, 4) AS pass_rate_pct
                 FROM batch_stats
             """)
             valid_cnt, quarantine_cnt, pass_rate = cur.fetchone()
-
-        passed = float(pass_rate) >= 99.80
-        return AssetCheckResult(
-            passed=passed,
-            severity=AssetCheckSeverity.ERROR if not passed else AssetCheckSeverity.WARN,
-            metadata={
-                "valid_trades_promoted": int(valid_cnt),
-                "quarantined_trades_isolated": int(quarantine_cnt),
-                "batch_pass_score_pct": float(pass_rate),
-                "sla_threshold_pct": 98.00,
-            },
-        )
     finally:
         conn.close()
+
+    total = int(valid_cnt) + int(quarantine_cnt)
+    if total == 0:
+        return AssetCheckResult(
+            passed=True,
+            metadata={"note": "Latest batch has no rows to score."},
+        )
+
+    passed = float(pass_rate) >= PASS_RATE_THRESHOLD_PCT
+    if not passed:
+        send_alert(
+            f":rotating_light: Trade quarantine check failed: {float(pass_rate):.2f}% of the latest "
+            f"batch passed ({int(quarantine_cnt)} of {total} rows quarantined). "
+            f"Threshold is {PASS_RATE_THRESHOLD_PCT}%. Triage SILVER.INTERMEDIATE.QUARANTINE_TRADE_EVENTS."
+        )
+    return AssetCheckResult(
+        passed=passed,
+        severity=AssetCheckSeverity.ERROR,
+        metadata={
+            "valid_trades_promoted": int(valid_cnt),
+            "quarantined_trades_isolated": int(quarantine_cnt),
+            "batch_pass_score_pct": float(pass_rate),
+            "sla_threshold_pct": PASS_RATE_THRESHOLD_PCT,
+            "alert_sent": (not passed) and bool(ALERT_WEBHOOK_URL),
+        },
+    )
+
 
 defs = Definitions(
     assets=[trading_dbt_assets],
