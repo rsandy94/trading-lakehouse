@@ -20,6 +20,7 @@ from dagster import (
     SkipReason,
     asset_check,
     define_asset_job,
+    get_dagster_logger,
     sensor,
 )
 from dagster_dbt import DbtCliResource, DbtProject, dbt_assets, get_asset_key_for_model
@@ -139,7 +140,7 @@ def send_alert(text: str) -> None:
     try:
         urllib.request.urlopen(request, timeout=10)
     except Exception as exc:  # noqa: BLE001
-        print(f"Alert webhook failed: {exc}")
+        get_dagster_logger().warning(f"Alert webhook failed: {exc}")
 
 
 @asset_check(
